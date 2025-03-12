@@ -678,107 +678,110 @@ components:
 
 opentelemetry-collector:
   enabled: true
-  image:
-    repository: "otel/opentelemetry-collector-contrib"
-  fullnameOverride: otel-collector
+  extraEnvsFrom:
+    - secretRef:
+        name: open-telemetry-collector
   mode: deployment
-  presets:
-    kubernetesAttributes:
-      enabled: true
-  resources:
-    limits:
-      memory: 200Mi
-  service:
-    type: ClusterIP
+  image:
+    repository: "otel/opentelemetry-collector-k8s"
+  fullnameOverride: otel-collector
   ports:
     metrics:
       enabled: true
-  podAnnotations:
-    prometheus.io/scrape: "true"
-    opentelemetry_community_demo: "true"
+  presets:
+    kubernetesAttributes:
+      enabled: true
+      extractAllPodLabels: true
   config:
-    receivers:
-      otlp:
-        protocols:
-          http:
-            # Since this collector needs to receive data from the web, enable cors for all origins
-            # `allowed_origins` can be refined for your deployment domain
-            cors:
-              allowed_origins:
-                - "http://*"
-                - "https://*"
-      httpcheck/frontend-proxy:
-        targets:
-          - endpoint: http://frontend-proxy:8080
-      redis:
-        endpoint: "valkey-cart:6379"
-        collection_interval: 10s
-
+    extensions:
+      bearertokenauth:
+        scheme: SUSEObservability
+        token: "${env:API_KEY}"
     exporters:
-      ## Create an exporter to Jaeger using the standard `otlp` export format
-      otlp:
-        endpoint: jaeger-collector:4317
-        tls:
-          insecure: true
-      # Create an exporter to Prometheus (metrics)
-      otlphttp/prometheus:
-        endpoint: http://prometheus:9090/api/v1/otlp
-        tls:
-          insecure: true
-      opensearch:
-        logs_index: otel
-        http:
-          endpoint: http://opensearch:9200
-          tls:
-            insecure: true
-
+      otlp/stackstate:
+        auth:
+          authenticator: bearertokenauth
+        endpoint: otlp-43.206.193.154.sslip.io:443
+      otlphttp/stackstate:
+         auth:
+            authenticator: bearertokenauth
+         endpoint: https://otlp-http-43.206.193.154.sslip.io      
     processors:
-      # This processor is used to help limit high cardinality on next.js span names
-      # When this PR is merged (and released) we can remove this transform processor
-      # https://github.com/vercel/next.js/pull/64852
-      transform:
-        error_mode: ignore
-        trace_statements:
-          - context: span
-            statements:
-              # could be removed when https://github.com/vercel/next.js/pull/64852 is fixed upstream
-              - replace_pattern(name, "\\?.*", "")
-              - replace_match(name, "GET /api/products/*", "GET /api/products/{productId}")
+      tail_sampling:
+        decision_wait: 10s
+        policies:
+        - name: rate-limited-composite
+          type: composite
+          composite:
+            max_total_spans_per_second: 500
+            policy_order: [errors, slow-traces, rest]
+            composite_sub_policy:
+            - name: errors
+              type: status_code
+              status_code: 
+                status_codes: [ ERROR ]
+            - name: slow-traces
+              type: latency
+              latency:
+                threshold_ms: 1000
+            - name: rest
+              type: always_sample
+            rate_allocation:
+            - policy: errors
+              percent: 33
+            - policy: slow-traces
+              percent: 33
+            - policy: rest
+              percent: 34
       resource:
         attributes:
+        - key: k8s.cluster.name
+          action: upsert
+          value: agent
         - key: service.instance.id
           from_attribute: k8s.pod.uid
           action: insert
-
+      filter/dropMissingK8sAttributes:
+        error_mode: ignore
+        traces:
+          span:
+            - resource.attributes["k8s.node.name"] == nil
+            - resource.attributes["k8s.pod.uid"] == nil
+            - resource.attributes["k8s.namespace.name"] == nil
+            - resource.attributes["k8s.pod.name"] == nil
     connectors:
-      spanmetrics: {}
-
+      spanmetrics:
+        metrics_expiration: 5m
+        namespace: otel_span
+      routing/traces:
+        error_mode: ignore
+        table: 
+        - statement: route()
+          pipelines: [traces/sampling, traces/spanmetrics]
     service:
+      extensions:
+        - health_check
+        - bearertokenauth
       pipelines:
         traces:
-          processors: [memory_limiter, resource, transform, batch]
-          exporters: [otlp, debug, spanmetrics]
+          receivers: [otlp]
+          processors: [filter/dropMissingK8sAttributes, memory_limiter, resource]
+          exporters: [routing/traces]
+        traces/spanmetrics:
+          receivers: [routing/traces]
+          processors: []
+          exporters: [spanmetrics]
+        traces/sampling:
+          receivers: [routing/traces]
+          processors: [tail_sampling, batch]
+          exporters: [debug, otlp/stackstate]
         metrics:
-          receivers: [httpcheck/frontend-proxy, redis, otlp, spanmetrics]
+          receivers: [otlp, spanmetrics, prometheus]
           processors: [memory_limiter, resource, batch]
-          exporters: [otlphttp/prometheus, debug]
-        logs:
-          processors: [memory_limiter, resource, batch]
-          exporters: [opensearch, debug]
-      telemetry:
-        metrics:
-          level: detailed
-          readers:
-            - periodic:
-                interval: 10000
-                timeout: 5000
-                exporter:
-                  otlp:
-                    protocol: grpc
-                    endpoint: otel-collector:4318
+          exporters: [debug, otlp/stackstate]
 
 jaeger:
-  enabled: true
+  enabled: false
   fullnameOverride: jaeger
   provisionDataStore:
     cassandra: false
@@ -810,7 +813,7 @@ jaeger:
     enabled: false
 
 prometheus:
-  enabled: true
+  enabled: false
   alertmanager:
     enabled: false
   configmapReload:
@@ -864,7 +867,7 @@ prometheus:
         memory: 300Mi
 
 grafana:
-  enabled: true
+  enabled: false
   fullnameOverride: grafana
   testFramework:
     enabled: false
@@ -941,7 +944,7 @@ grafana:
       memory: 150Mi
 
 opensearch:
-  enabled: true
+  enabled: false
   fullnameOverride: opensearch
   clusterName: demo-cluster
   nodeGroup: otel-demo
