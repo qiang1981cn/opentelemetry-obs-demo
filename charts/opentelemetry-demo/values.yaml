@@ -677,7 +677,7 @@ components:
       runAsNonRoot: true
 
 opentelemetry-collector:
-  enabled: true
+  enabled: false
   extraEnvsFrom:
     - secretRef:
         name: open-telemetry-collector
